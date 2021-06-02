@@ -1,0 +1,117 @@
+    uint public callFee = 1000;
+    uint public treasuryFee = 9000;
+    uint public securityFee = 10;
+    uint public totalFee = 500;
+    uint constant public MAX_FEE = 500;
+    uint constant  public PERCENT_DIVISOR = 10000;
+
+    /**
+     * @dev Routes we take to swap tokens using PanrewardTokenSwap.
+     * {rewardTokenToWftmRoute} - Route we take to get from {rewardToken} into {wftm}.
+     * {rewardTokenToLp0Route} - Route we take to get from {rewardToken} into {lpToken0}.
+     * {rewardTokenToLp1Route} - Route we take to get from {rewardToken} into {lpToken1}.
+     */
+    address[] public rewardTokenToWftmRoute = [rewardToken, wftm];
+    address[] public rewardTokenToLp0Route;
+    address[] public rewardTokenToLp1Route;
+
+    /**
+     * {StratHarvest} Event that is fired each time someone harvests the strat.
+     * {TotalFeeUpdated} Event that is fired each time the total fee is updated.
+     * {CallFeeUpdated} Event that is fired each time the call fee is updated.
+     */
+    event StratHarvest(address indexed harvester);
+    event TotalFeeUpdated(uint newFee);
+    event CallFeeUpdated(uint newCallFee, uint newTreasuryFee);
+
+    /**
+     * @dev Initializes the strategy. Sets parameters, saves routes, and gives allowances.
+     * @notice see documentation for each variable above its respective declaration.
+     */
+    constructor (
+      address _lpPair,
+      uint8 _poolId,
+      address _vault,
+      address _treasury
+    ) public {
+        lpPair = _lpPair;
+        poolId = _poolId;
+        vault = _vault;
+        treasury = _treasury;
+
+        lpToken0 = IUniswapV2Pair(lpPair).token0();
+        lpToken1 = IUniswapV2Pair(lpPair).token1();
+
+        if (lpToken0 == wftm) {
+            rewardTokenToLp0Route = [rewardToken, wftm];
+        } else if (lpToken0 != rewardToken) {
+            rewardTokenToLp0Route = [rewardToken, wftm, lpToken0];
+        }
+
+        if (lpToken1 == wftm) {
+            rewardTokenToLp1Route = [rewardToken, wftm];
+        } else if (lpToken1 != rewardToken) {
+            rewardTokenToLp1Route = [rewardToken, wftm, lpToken1];
+        }
+
+        giveAllowances();
+    }
+
+    /**
+     * @dev Function that puts the funds to work.
+     * It gets called whenever someone deposits in the strategy's vault contract.
+     * It deposits {lpPair} in the masterChef to farm {rewardToken}
+     */
+    function deposit() public whenNotPaused {
+        uint256 pairBal = IERC20(lpPair).balanceOf(address(this));
+
+        if (pairBal > 0) {
+            IMasterChef(masterChef).deposit(poolId, pairBal);
+        }
+    }
+
+    /**
+     * @dev Withdraws funds and sents them back to the vault.
+     * It withdraws {lpPair} from the masterChef.
+     * The available {lpPair} minus fees is returned to the vault.
+     */
+    function withdraw(uint256 _amount) external {
+        require(msg.sender == vault, "!vault");
+
+        uint256 pairBal = IERC20(lpPair).balanceOf(address(this));
+
+        if (pairBal < _amount) {
+            IMasterChef(masterChef).withdraw(poolId, _amount.sub(pairBal));
+            pairBal = IERC20(lpPair).balanceOf(address(this));
+        }
+
+        if (pairBal > _amount) {
+            pairBal = _amount;
+        }
+        uint256 withdrawFee = pairBal.mul(securityFee).div(PERCENT_DIVISOR);
+        IERC20(lpPair).safeTransfer(vault, pairBal.sub(withdrawFee));
+    }
+
+    /**
+     * @dev Core function of the strat, in charge of collecting and re-investing rewards.
+     * 1. It claims rewards from the masterChef.
+     * 2. It charges the system fees to simplify the split.
+     * 3. It swaps the {rewardToken} token for {lpToken0} & {lpToken1}
+     * 4. Adds more liquidity to the pool.
+     * 5. It deposits the new LP tokens.
+     */
+    function harvest() external whenNotPaused {
+        require(!Address.isContract(msg.sender), "!contract");
+        IMasterChef(masterChef).deposit(poolId, 0);
+        chargeFees();
+        addLiquidity();
+        deposit();
+
+        emit StratHarvest(msg.sender);
+    }
+
+    /**
+     * @dev Takes out fees from the rewards. Set by constructor
+     * callFeeToUser is set as a percentage of the fee,
+     * as is treasuryFeeToVault
+     */
